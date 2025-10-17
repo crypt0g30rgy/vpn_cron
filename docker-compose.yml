@@ -1,0 +1,59 @@
+version: "3.8"
+
+services:
+  protonvpn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vpn-cron
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      - TZ=UTC
+    volumes:
+      - ./openvpn:/etc/openvpn
+      - ./logs:/var/log
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    restart: always
+
+    healthcheck:
+      test: |
+        bash -c '
+          if ! ip a show tun0 &>/dev/null; then
+            echo "No tun0 interface"
+            exit 1
+          fi
+          IP=$(curl -s --max-time 5 https://ipinfo.io/ip || true)
+          if [ -z "$IP" ]; then
+            echo "No external IP detected"
+            exit 1
+          fi
+          echo "VPN OK ($IP)"
+          exit 0
+        '
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+  
+  # Example usage
+  # myapp:
+  #   image: alpine
+  #   command: ["sh", "-c", "curl ifconfig.me && sleep infinity"]
+  #   depends_on:
+  #   protonvpn:
+  #   condition: service_healthy
+  #   network_mode: "service:protonvpn"
