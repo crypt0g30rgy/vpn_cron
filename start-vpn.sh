@@ -1,11 +1,35 @@
 #!/bin/bash
 set -euo pipefail
 
-LOG_FILE="/var/log/openvpn.log"
+# LOG_FILE="/var/log/openvpn.log"
+
+# Log file based on timestamp
+TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+LOG_FILE="/var/log/vpn-cron/openvpn_$TIMESTAMP.log"
 VPN_DIR="/etc/openvpn"
-CRED_FILE="$VPN_DIR/vpn-credentials.txt"
+# Allow overriding the credential file path via env (useful when mounting elsewhere)
+CRED_FILE="${VPN_CRED_FILE:-$VPN_DIR/vpn-credentials.txt}"
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] | Starting ProtonVPN with rotation, kill switch, and DNS leak protection..."
+
+# If an env file exists at /opt/.env (image convention), load it so DISCORD_WEBHOOK_URL or other vars are available
+if [[ -f /opt/.env ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source /opt/.env
+  set +a
+fi
+# Fail early if credentials file missing (helps debugging when mounting/packaging)
+if [[ ! -f "$CRED_FILE" ]]; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] | ERROR: credentials file $CRED_FILE not found"
+  # If a webhook is available, try to alert
+  if [[ -n "${DISCORD_WEBHOOK_URL:-}" ]]; then
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S %Z')
+    payload=$(jq -n --arg content "[$timestamp] ERROR: VPN credentials missing at $CRED_FILE" '{content:$content}')
+    curl -s -X POST -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK_URL" >/dev/null || true
+  fi
+  exit 1
+fi
 
 # Pick a random .ovpn config
 mapfile -t configs < <(find "$VPN_DIR" -maxdepth 1 -type f -name "*.ovpn" | sort)
@@ -22,21 +46,18 @@ VPN_IP=$(getent ahosts "$VPN_SERVER" | awk '{print $1; exit}')
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] | VPN Server: $VPN_SERVER ($VPN_IP)"
 
 # Make sure we start clean
-iptables -F
-iptables -P OUTPUT ACCEPT
-iptables -P INPUT ACCEPT
-iptables -P FORWARD ACCEPT
+/usr/sbin/iptables -F
+/usr/sbin/iptables -P OUTPUT ACCEPT
+/usr/sbin/iptables -P INPUT ACCEPT
+/usr/sbin/iptables -P FORWARD ACCEPT
 
 # Allow connection to VPN server during handshake
-iptables -A OUTPUT -d "$VPN_IP" -j ACCEPT
-iptables -A OUTPUT -o lo -j ACCEPT
-iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-# Optional: use ProtonVPN DNS (prevents leaks)
-echo "nameserver 10.8.8.1" > /etc/resolv.conf || true
+/usr/sbin/iptables -A OUTPUT -d "$VPN_IP" -j ACCEPT
+/usr/sbin/iptables -A OUTPUT -o lo -j ACCEPT
+/usr/sbin/iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
 # Run OpenVPN in background
-openvpn --config "$VPN_CONFIG" \
+/usr/sbin/openvpn --config "$VPN_CONFIG" \
   --auth-user-pass "$CRED_FILE" \
   --pull-filter ignore "auth-token" \
   --writepid /var/run/openvpn.pid \
@@ -62,16 +83,31 @@ fi
 
 # Enable kill switch AFTER successful connection
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] | Applying kill switch rules..."
-iptables -F
-iptables -P OUTPUT DROP
-iptables -A OUTPUT -o tun0 -j ACCEPT
-iptables -A OUTPUT -o lo -j ACCEPT
-iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-iptables -A OUTPUT -d "$VPN_IP" -j ACCEPT
+/usr/sbin/iptables -F
+/usr/sbin/iptables -P OUTPUT DROP
+/usr/sbin/iptables -A OUTPUT -o tun0 -j ACCEPT
+/usr/sbin/iptables -A OUTPUT -o lo -j ACCEPT
+/usr/sbin/iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+/usr/sbin/iptables -A OUTPUT -d "$VPN_IP" -j ACCEPT
 
-# Confirm current IP
+# Now that tun0 is up, optionally use ProtonVPN DNS to avoid leaks
+echo "nameserver 10.8.8.1" > /etc/resolv.conf || true
+
+# Confirm current IP (and detect DNS resolution issues)
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] | Current IP:"
-curl -s https://ipinfo.io || echo "Could not fetch IP info (curl DNS issue)."
+IPINFO_OUT=$(curl -sS --max-time 10 https://ipinfo.io 2>&1) || true
+if echo "$IPINFO_OUT" | grep -qi "Could not resolve host\|Name or service not known\|Temporary failure in name resolution"; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] | DNS resolution failed when querying ipinfo.io: upgrading resolv.conf to public DNS (1.1.1.1, 8.8.8.8)"
+  echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf || true
+  # retry
+  IPINFO_OUT=$(curl -sS --max-time 10 https://ipinfo.io 2>&1) || true
+fi
+
+if [[ -n "$IPINFO_OUT" ]]; then
+  echo "$IPINFO_OUT" | sed -n '1,200p'
+else
+  echo "Could not fetch IP info (curl DNS issue)."
+fi
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] | VPN ready and traffic locked."
 

@@ -13,12 +13,20 @@ services:
     environment:
       - TZ=UTC
     volumes:
-      - ./openvpn:/etc/openvpn
-      - ./logs:/var/log
+      # NOTE: mounting a host dir onto /etc/openvpn will hide any files
+      # that were copied there at build time (this is why the credentials
+      # could appear "missing" in the running container). Bind the
+      # credentials file explicitly so it is always present at runtime.
+      - ./protonvpn-configs:/etc/openvpn
+      - ./vpn-credentials.txt:/etc/openvpn/vpn-credentials.txt:ro
+      - ./logs:/var/log/vpn-cron
+      - ./.env:/opt/.env
     dns:
       - 1.1.1.1
       - 8.8.8.8
     restart: always
+    networks:
+      - vpn_net
 
     healthcheck:
       test: |
@@ -48,7 +56,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-  
   # Example usage
   # myapp:
   #   image: alpine
@@ -57,3 +64,7 @@ services:
   #   protonvpn:
   #   condition: service_healthy
   #   network_mode: "service:protonvpn"
+
+networks:
+  vpn_net:
+    external: true
